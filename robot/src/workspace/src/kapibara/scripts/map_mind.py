@@ -4,6 +4,7 @@ import codon
 import os
 import rclpy
 from rclpy.node import Node
+import tf_transformations
 
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
@@ -107,6 +108,57 @@ FACE_TOLERANCE = 0.94
 
 import chromadb
 
+class DetectionPipeline:
+    def __init__(self,cls_model_path:str,detection_model_path:str):
+        self.cls_model = YOLO(cls_model_path)
+        self.detection_model = YOLO(detection_model_path)
+        
+    def run(self,frame):
+        """
+        A function that performs detection and classification
+        pipeline.
+        
+        It returns list with results, each containing:
+            - embedding
+            - x postion
+            - y position
+            - width
+            - height
+            - confidence score
+        """        
+        output = []
+        
+        results = self.detection_model(frame)
+        
+        for result in results:
+            if result.boxes is None:
+                continue
+            boxes = result.boxes
+            for box in boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = box.conf[0]
+                
+                obj = frame[y1:y2,x1:x2]
+                
+                cls_result = self.cls_model(obj)
+                                
+                for res in cls_result:
+                    output.append(
+                        (
+                            res.probs.data.cpu().numpy(),
+                            x1,
+                            y1,
+                            x2 - x1,
+                            y2 - y1,
+                            conf
+                        )
+                    )
+                    
+        return output
+    
+    def get_class_names(self):
+        return self.cls_model.names
+
 class MapMind(Node):
 
     def __init__(self):
@@ -118,15 +170,17 @@ class MapMind(Node):
         
         package_path = get_package_share_directory('kapibara')
         
-        self.declare_parameter('yolo_model_path','yolov11n-face_float32.tflite')
+        self.declare_parameter('yolo_model_cls_path','yolov8n-cls_full_integer_quant.tflite')
+        self.declare_parameter('yolo_model_path','yolov8n_full_integer_quant.tflite')
         self.declare_parameter('deepid_model_path','deepid.tflite')
         
         self.max_linear_speed = self.get_parameter('max_linear_speed').get_parameter_value().double_value
         self.max_angular_speed = self.get_parameter('max_angular_speed').get_parameter_value().double_value
         
         yolo_model_path = self.get_parameter('yolo_model_path').get_parameter_value().string_value
-        
-        self.face_yolo = YOLO(os.path.join(package_path,'model',yolo_model_path))
+        yolo_model_cls_path = self.get_parameter('yolo_model_path').get_parameter_value().string_value
+                
+        self.detection_pipeline = DetectionPipeline(yolo_model_cls_path,yolo_model_path)
         
         deepid_model_path = self.get_parameter('deepid_model_path').get_parameter_value().string_value
         
@@ -275,13 +329,15 @@ class MapMind(Node):
         
         self.twist_pub.publish(twist)
         
+        self.last_cmd = (linear,angular)
+        
         # estimate position based on speed solely
         # it will be filter out using external odometry /
         # map info
-        self.yaw += angular*self.timer_period
+        # self.yaw += angular*self.timer_period
         
-        self.x += linear*np.cos(self.yaw)*self.timer_period
-        self.y += linear*np.sin(self.yaw)*self.timer_period
+        # self.x += linear*np.cos(self.yaw)*self.timer_period
+        # self.y += linear*np.sin(self.yaw)*self.timer_period
         
     def stop(self):
         self.send_command(0.0,0.0)
@@ -292,6 +348,8 @@ class MapMind(Node):
             odom.pose.pose.position.y,
             odom.pose.pose.position.z,
             ])
+        
+        self.yaw = tf_transformations.euler_from_quaternion(odom.pose.pose.orientation)[2]
     
     def mic_callback(self,mic:Microphone):
         
@@ -496,9 +554,9 @@ class MapMind(Node):
         spec_id = self.action_graph.add_node(self.spectogram,score)
         
         # Update graph connections
-        if len(self.last_id_img):
+        if len(self.last_id_img) and self.last_id_img != img_id:
             self.action_graph.connect_nodes(self.last_id_img,img_id,self.last_cmd)
-        if len(self.last_id_spec):
+        if len(self.last_id_spec) and self.last_id_spec != spec_id:
             self.action_graph.connect_nodes(self.last_id_spec,spec_id,self.last_cmd)
             
         self.last_id_img = img_id
@@ -518,6 +576,12 @@ class MapMind(Node):
         # Remove points that have low lifetime
         self.point_map = list(filter(lambda x: x[3] > 0.01,self.point_map))              
         
+        max_point = max(self.point_map,key=lambda x: x[3])
+        
+        if max_point is not None:
+            # move towards that point 
+            pass
+        
         # They are not needed anymore
         self.found_objects.clear()
         
@@ -536,9 +600,9 @@ class MapMind(Node):
         self.last_spectogram = self.spectogram
         self.last_img = img
         
-        if score >= 0.0:
-            self.stop()
-            return
+        # if score >= 0.0:
+        #     self.stop()
+        #     return
         
             
         img_action = self.get_commands_for_state(img_id)
