@@ -1,12 +1,15 @@
 services:
-  vec_db:
-    restart: unless-stopped
-    container_name: vec_db_qdrant
-    image: qdrant/qdrant
-
-    volumes:
-      - ./db/:/qdrant/storage:z
-
+  db:
+    hostname: db
+    image: ankane/pgvector
     ports:
-      - 6333:6333
-      - 6334:6334
+     - 5432:5432
+    restart: always
+    environment:
+      - POSTGRES_DB=vectordb
+      - POSTGRES_USER=testuser
+      - POSTGRES_PASSWORD=testpwd
+      - POSTGRES_HOST_AUTH_METHOD=trust
+    volumes:
+     - ./db:/var/lib/postgresql/data
+     - ./postgres/schema.sql:/docker-entrypoint-initdb.d/schema.sql

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
+import codon
 
 import os
 import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 
 from sensor_msgs.msg import Range,Imu,PointCloud2
 from geometry_msgs.msg import Quaternion
@@ -49,15 +51,34 @@ import time
 
 import librosa
 
-from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance,OrderBy,PayloadSchemaType
 from qdrant_client.http import models
-
-import random
 
 import uuid
 
 from tiny_vectordb import VectorDatabase
+from kapibara.kapi_graphs import Graph
+
+'''
+
+A working of map mind of KapiBara robot is inner working is based 
+on graph databases:
+
+- Graph database that represents relations between states and actions connecting them
+- Emotions relations ship that to every detected object it associates emotional state, when it is diffrent than 0
+
+Our robot will move to the place with more positive emotional state and use few estimators that will 
+attach those points to the map, for example when our robots see a object that makes him happy it 
+will use readings from point cloud to estimate its position in space and then add point with positive emotional state to the map.
+
+We can use something similar for sound, too, and then estimate a direction of sound source and add its source.
+
+Action graph works on principle when a state in the graph is triggered it will search through actions to find target state 
+with most positive outcome and then perform actions collected on the path to that state.
+
+
+'''
+
 
 ID_TO_EMOTION_NAME = [
     "angry",
@@ -73,14 +94,8 @@ ML_SPECTOGRAM_EMBEDDING_SHAPE = 32*32
 # month, day, hour, minute, second
 TIME_EMBEDDING_SHAPE = 5
 
-IMG_ACTION_SET_NAME = "actions_sets"
-SPECTOGRAM_ACTION_NAME = "ml_actions_sets"
-
-GENERAL_POINT_DB_NAME = "general_point_database"
-GENRAL_POINT_EMBEDDING_SHAPE = 64
-
-GENERAL_ACTION_DB_NAME = "general_action_database"
-GENRAL_POINT_EMBEDDING_SHAPE = 64
+OBJECT_DB = "object_database"
+OBJECT_EMBEDDING_SHAPE = 32*32
 
 POINT_MAP_DB = "points_database"
 POINT_IMG_DB = "points_imgages"
@@ -88,164 +103,9 @@ POINT_SPEC_DB = "points_spect"
 POINT_TIME_DB = "points_time"
 
 
-def split_embedding(input):
-    
-    x = 0
-    y = 0
-    
-    steps = int(56/8)
-    
-    embeddings = []
-    
-    for y in range(steps):
-        for x in range(steps):
-            embeddings.append(
-                input[x*8:x*8 + 8,y*8:y*8 + 8].flatten()
-            )
-        
-    return embeddings
-    
-
-def generate_embedding(img,depth):
-    '''
-    generate_embedding 
-    
-    In that case it takes image and 
-    depth image, merges them and split them
-    into equal parts.
-    
-    :param img: Associated RGB image
-    :param depth: Associated depth image
-    '''
-    
-    img = cv2.resize(img,(56,56)).astype(np.float32) / 255.0
-    b,g,r = cv2.split(img)
-    
-    img = 0.4*r + 0.5*g + 0.1*b
-    
-    depth = cv2.resize(depth,(56,56))
-    
-    img_merged = img+depth
-
-    return split_embedding(img_merged)
-
-def generate_embedding_spec(spec):
-    
-    return split_embedding(spec)
-
-
 FACE_TOLERANCE = 0.94
 
-
-class FaceSqlite:
-    
-    def __init__(self,db) -> None:
-        
-        self.db = db
-        
-        self.init_databse()
-                
-    def init_databse(self):
-        
-        if not self.db.collection_exists("faces"):
-            self.db.create_collection(
-                collection_name="faces",
-                vectors_config=VectorParams(size=160, distance=Distance.COSINE),
-            )
-            
-            self.db.create_payload_index(
-                collection_name="faces",
-                field_name="time",
-                field_schema=PayloadSchemaType.INTEGER
-            )
-            
-            self.db.create_payload_index(
-                collection_name="faces",
-                field_name="score",
-                field_schema=PayloadSchemaType.INTEGER
-            )
-    
-    def get_face(self,face_embedding:np.ndarray):
-        
-        hits = self.db.query_points(
-            collection_name="faces",
-            query=face_embedding,
-            limit=3
-        )
-        
-        for hit in hits.points:
-            if hit.score < 0.1:
-                return hit.payload
-            
-    def check_size(self):
-        
-        return self.db.count("faces").count
-        
-    def update_face(self,face_embedding:np.ndarray,score:float):
-        
-        # check size
-        
-        size = self.check_size()
-        
-        if size >= 500:
-            
-            results = self.db.scroll(
-                collection_name="faces",
-                limit=1,
-                order_by=OrderBy(
-                    key="time",
-                    direction="asc"
-                )
-            )
-                        
-            results = results[0][0]
-                                                
-            id = results.id
-            
-            payload = results.payload
-            
-            payload["score"] = score
-            payload["time"] = time.time_ns()
-            
-            self.db.upsert(
-                collection_name="faces",
-                points=[
-                    models.PointStruct(
-                        id=id,
-                        vector=face_embedding,
-                        payload=payload  # new payload
-                    )
-                ]
-            )
-            
-            return
-            
-        
-        # check if face exists
-        face = self.get_face(face_embedding)
-        
-        id = size+1
-        
-        if face is not None:
-            id = face.id
-                        
-        payload = {}
-        
-        payload["score"] = score
-        payload["time"] = time.time_ns()
-        
-        self.db.upsert(
-            collection_name="faces",
-            points=[
-                models.PointStruct(
-                    id=size+1,
-                    vector=face_embedding,
-                    payload=payload  # new payload
-                )
-            ]
-        )
-
-
+import chromadb
 
 class MapMind(Node):
 
@@ -281,6 +141,12 @@ class MapMind(Node):
         self.timer_period = self.get_parameter('tick_time').get_parameter_value().double_value  # seconds
         self.timer = self.create_timer(self.timer_period, self.tick_callback)
         
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            'odom',
+            self.odom_callback,
+            10)
+        
         self.image_sub = self.create_subscription(
             Image,
             'camera',
@@ -313,15 +179,24 @@ class MapMind(Node):
         
         self.initialize_db()
         
+        # Embedings have a form of 64x64 image/spectogram data
+        self.action_graph = Graph(database_name="actions_graph")
+        
+        # A list of objects found in the scene, 64x64 embeddings with bouding boxes
+        self.found_objects = []
+        
+        # A map of points with X,Y positions and associated emotional state, and
+        # decay factor
+        self.point_map = []
+        
         # self.face_db = FaceSqlite(self.db)
         
         self.pat_detected = 0.0
                 
         self.emotion_state = 0.0
         
-        self.last_img_embeddings = []
-        
-        self.last_spectogram_embeddings = []
+        self.last_img = np.zeros((64,64),dtype=np.float32)
+        self.last_spectogram = np.zeros((64,64),dtype=np.float32)
         
         self.action_list = []
         self.action_executing = False
@@ -330,6 +205,10 @@ class MapMind(Node):
         self.image = None
         self.depth = None
         self.spectogram = None
+        
+        self.last_cmd = (0.0,0.0)
+        
+        self.position = np.zeros(3)
         
         self.emotion = Emotions()
         
@@ -349,6 +228,9 @@ class MapMind(Node):
         self.wait_for_depth = True
         
         self.last_score = 0
+        
+        self.last_id_spec = ""
+        self.last_id_img = ""
         
         # robot position in the map
         self.x = 0
@@ -375,97 +257,8 @@ class MapMind(Node):
         
     def initialize_db(self):
         
-        collection_configs = [
-            {
-                'name': GENERAL_POINT_DB_NAME,
-                'dimension': GENRAL_POINT_EMBEDDING_SHAPE,
-            },
-            {
-                'name': POINT_MAP_DB,
-                'dimension': 2
-            },
-            {
-                'name':'faces',
-                'dimension':160
-            }
-        ]
-        
-        self.db = VectorDatabase("test.db", collection_configs)
-        
-        self.general_db = self.db[GENERAL_POINT_DB_NAME]
-        self.point_db = self.db[POINT_MAP_DB]
-        
-            
-    def get_points_in_radius(self,x:float,y:float,radius:float = 0.5)->list[tuple]:
-        
-        search_ids, search_scores = self.point_db.search([x,y], k=64)
-
-        values = []
-        points_id = []
-        points = []
-        for id,score in zip(search_ids, search_scores):
-            if score > radius:
-                continue
-            
-            payload = id.split(":")[1]
-            values.append(float(payload))
-            points_id.append(id)
-            # points.append((,vec[1],float(payload)))
-
-        for val,block in zip(values,self.point_db.getBlock(points_id)):
-            points.append((block[0],block[1],val))
-        
-        return points
-
-    def get_point_at_position(self,x:float,y:float,pop:bool = False)->float:
-        """
-        Docstring for get_point_at_position
-        
-        :param x: x position in 2D space
-        :type x: float
-        :param y: y position in 2D space
-        :type y: float
-        :param pop: whether to remove point from map
-        :type pop: bool
-        :return: associated value with point id in database
-        :rtype: float
-        """
-        
-        search_ids, search_scores = self.point_db.search([x,y], k=1)
-        
-        
-        if len(search_ids) == 1 and \
-            search_scores[0] < 0.01:
-
-            value = float(search_ids[0].split(":")[1])
-            
-            if pop:
-                # pop the point from the map
-                self.point_db.deleteBlock(
-                    [search_ids[0]]
-                )
-        
-            return value
-
-        return 0.0
-    
-    def push_point_at_position(self,x:float,y:float,value:float):
-        
-        search_ids, search_scores = self.point_db.search([x,y], k=1)
-
-        if len(search_ids) == 1 and \
-            search_scores[0] < 0.01:
-            
-            self.point_db.deleteBlock(
-                [search_ids[0]]
-            )
-
-        new_id = str(uuid.uuid4())+":"+str(new_id)
-        
-        self.point_db.setBlock(
-            [new_id],
-            [[x,y]]
-        )        
+        self.associated_db = chromadb.PersistentClient("association_db")
+        self.obj_db = self.associated_db.create_collection("obj",get_or_create=True)
         
     def send_command(self,linear:float,angular:float):
         
@@ -493,6 +286,13 @@ class MapMind(Node):
     def stop(self):
         self.send_command(0.0,0.0)
         
+    def odom_callback(self,odom:Odometry):
+        self.position = np.array([
+            odom.pose.pose.position.x,
+            odom.pose.pose.position.y,
+            odom.pose.pose.position.z,
+            ])
+    
     def mic_callback(self,mic:Microphone):
         
         self.get_logger().debug("Mic callback")
@@ -509,11 +309,6 @@ class MapMind(Node):
         
         start = timer()
         
-        # speech_detect = self.vad.is_speech(self.mic_buffor, 16000)
-        
-        # if speech_detect:
-        #     self.uncertain_speech = 1.0
-        
         spectogram = librosa.feature.melspectrogram(y=self.mic_buffor, sr=16000,n_mels=224,hop_length=143)
         
         self.get_logger().info(f"Spectogram size: {spectogram.shape}")
@@ -523,11 +318,10 @@ class MapMind(Node):
                 
         self.get_logger().debug("Hearing time: "+str(timer() - start)+" s")
         
-        self.spectogram = cv2.resize(spectogram,(56,56))
+        self.spectogram = cv2.resize(spectogram,(64,64),interpolation=cv2.INTER_LINEAR) / 255.0
         
-        # self.get_logger().debug("Hearing output: "+str(self.hearing.answers[output]))
-        
-        # self.audio_output = output
+        # Indicate that it is audio data
+        self.spectogram[0] = -10.0
         
         mean = np.mean(np.abs(combine))
         
@@ -536,7 +330,7 @@ class MapMind(Node):
             
     def ext_emotion_callback(self,msg:Emotions):
         self.ext_emotion = msg
-                
+    
     def depth_image_callback(self,msg:Image):
         
         self.get_logger().info('I got depth image with format: %s' % msg.encoding)
@@ -544,7 +338,7 @@ class MapMind(Node):
         self.depth = self.bridge.imgmsg_to_cv2(msg)
         
         self.wait_for_depth = False
-        
+    
     def image_callback(self,msg:Image):
         
         self.get_logger().info('I got image with format: %s' % msg.encoding)
@@ -552,8 +346,27 @@ class MapMind(Node):
         self.image = self.bridge.imgmsg_to_cv2(msg)
         
         self.wait_for_img = False
-                
+    
+    @codon.jit
+    @staticmethod
+    def points_callback_codon_code(points:np.ndarray):
+        sorted_points = np.sort(points)
+        
+        min_points = np.mean(sorted_points[0:10])
+        
+        obstacle_detected = float(np.exp(-min_points*25))
+        
+        obstacle_detected = min(obstacle_detected,1.0)
+        
+        if obstacle_detected < 0.01:
+            obstacle_detected = 0.0
+            
+        return obstacle_detected
+      
     def points_callback(self, msg: PointCloud2):
+        
+        start = timer()
+        
         # Read points from PointCloud2
         points = point_cloud2.read_points_numpy(
             msg,
@@ -562,19 +375,10 @@ class MapMind(Node):
             reshape_organized_cloud=True
         )
         
-        sorted_points = np.sort(points)
-        
-        min_points = np.mean(sorted_points[0:10])
-        
-        self.obstacle_detected = float(np.exp(-min_points*25))
-        
-        self.obstacle_detected = min(self.obstacle_detected,1.0)
-        
-        if self.obstacle_detected < 0.01:
-            self.obstacle_detected = 0.0
+        self.obstacle_detected = MapMind.points_callback_codon_code(points)
                 
         if self.obstacle_detected:    
-            self.get_logger().info(f'Obstacle detected! {self.obstacle_detected}, min point {min_points}')
+            self.get_logger().info(f'Obstacle detected! {self.obstacle_detected}, time: {timer() - start} s')
             
     def sense_callabck(self,sense:PiezoSense):
         
@@ -591,24 +395,12 @@ class MapMind(Node):
             self.pat_detected = 1.0
                         
             score = 10
-                                                    
-            # self.stop_mind()
-                        
-            if score !=0 and len(self.current_face_embeddings)>0:
-                # check if spotted face are present in database:
-                    
-                # sort by distances from robot                
-                self.current_face_embeddings = sorted(self.current_face_embeddings,key=lambda x: x[1],reverse=True)
                 
-                nearest_face = self.current_face_embeddings[0]                
-                
-                self.face.update_face(nearest_face,score)
-                
-                            
+    @codon.jit            
     def emotion_state_calculate(self,emotions:list[float]):
                 
         return  emotions[2]*320.0 + emotions[1]*-120.0 + emotions[3]*-40.0 + emotions[0]*-60.0 + emotions[4]*-20.0
-        
+    
     def send_ears_state(self,emotions:list[float]):
         
         max_id = 4
@@ -636,99 +428,202 @@ class MapMind(Node):
                 and type(payload["actions"]) is list \
                 and type(payload["score"]) is float
                 
-    
-    def add_point_to_embeddings(self,point:tuple,embeddings):
+    def add_score_to_embeddings(self,score:float,embedding:np.ndarray):
         """
-        Docstring for add_point_to_embeddings
+        Docstring for add_score_to_embeddings
         
         :param self: Description
-        :param point: list with points (x,y,v) - x,y position in 2D space
+        :param score: float value to be associated with the embedding
+        :param embedding: numpy array representing the embedding to be stored
                 v - associated value
         :type points: list[tuple]
         """
+                
+        new_id = uuid.uuid4()
+                                        
+        payload = str(score)
         
-        points_id = []
-
-        for embedding in embeddings:
-            
-            new_id = uuid.uuid4()
-                                    
-            n_points = np.array(point,dtype=np.float32)
-            
-            payload = n_points
-            
-            self.get_logger().debug("Updating image embedding.")
-
-            payload = base64.b64encode(payload.tobytes())
-            
-            points_id.append(str(new_id)+":"+payload.decode('ascii'))
+        self.get_logger().debug("Updating image embedding.")
+        
+        points_id = [str(new_id)+":"+payload]
         
         self.general_db.setBlock(
             points_id,
-            embeddings
+            [embedding]
+        )
+    
+    def get_score_from_embeddings(self,embedding:np.ndarray)->float:
+        # check if embeddings aren't aleardy presents
+        
+        search_ids, search_scores = self.general_db.search(embedding, k=4)
+        
+        for id,score in zip(search_ids, search_scores):
+            if score > 0.1:
+                continue
+                
+            payload = id.split(":")[1].encode('ascii')
+            
+            return float(payload)
+        
+    def move_towards_point(self):
+        """
+        Returns command that will move robot 
+        closer to the most positive point
+        """
+        # TODO
+        return (0,0)
+    
+    def point_seeking(self,score:float):
+        # Update embeddings in the database with new score
+        
+        img = cv2.cvtColor(self.image,cv2.COLOR_BGR2GRAY)
+        
+        img = cv2.resize(img,(64,64),interpolation=cv2.INTER_LINEAR) / 255.0
+        
+        # This way we indicate that it is image data
+        img[0] = 10.0
+        
+        pos = (
+            self.position[0],
+            self.position[1],
+            self.position[2],
         )
         
-    def get_points_from_embeddings(self,embeddings)->list[tuple]:
+        # Update embeddings with audio data
+        img_id = self.action_graph.add_node(img,score)
         
-        points = []
+        # Update graph with new score and connections
+        spec_id = self.action_graph.add_node(self.spectogram,score)
         
-        requests = []
-        
-        for embedding in embeddings:
+        # Update graph connections
+        if len(self.last_id_img):
+            self.action_graph.connect_nodes(self.last_id_img,img_id,self.last_cmd)
+        if len(self.last_id_spec):
+            self.action_graph.connect_nodes(self.last_id_spec,spec_id,self.last_cmd)
             
-            # check if embeddings aren't aleardy presents
-            
-            search_ids, search_scores = self.general_db.search(embedding, k=4)
-            
-            for id,score in zip(search_ids, search_scores):
-                if score > 0.1:
-                    continue
-                    
-                payload = id.split(":")[1].encode('ascii')
-                payload = base64.b64decode(payload)
-                
-                point = np.frombuffer(payload, dtype=np.float32)
-                
-                points.append(point)
+        self.last_id_img = img_id
+        self.last_id_spec = spec_id
         
-        return points
+        # propagate score, through graph
+        self.propogate_value_through_graph(spec_id,score)
+        self.propogate_value_through_graph(img_id,score)
+        
+        # Retrive points
+        # Retrive points from visible objects
+        # TODO
+        
+        for point in self.point_map:
+            point[3] = point[3]*0.95
+        
+        # Remove points that have low lifetime
+        self.point_map = list(filter(lambda x: x[3] > 0.01,self.point_map))              
+        
+        # They are not needed anymore
+        self.found_objects.clear()
+        
+        # Move towards point with higher positive value
+        # Here is a algorithm for moving
+        cmd = self.move_towards_point()
+        
+        self.send_command(cmd[0],cmd[1])
+        
+        self.last_cmd = cmd
+        
+        dscore = score - self.last_score
+
+        self.last_score = score
+        
+        self.last_spectogram = self.spectogram
+        self.last_img = img
+        
+        if score >= 0.0:
+            self.stop()
+            return
+        
+            
+        img_action = self.get_commands_for_state(img_id)
+        
+        spec_action = self.get_commands_for_state(spec_id)
+        
+        if img_action is None and spec_action is None:
+            return
+        
+        if img_action is None and spec_action is not None:
+            self.send_command(spec_action[1],spec_action[2])
+            return
+        
+        if img_action is not None and spec_action is None:
+            self.send_command(img_action[1],img_action[2])
+            return
+        
+        if img_action[0] > spec_action[0]:
+            self.send_command(img_action[1],img_action[2])
+        else:
+            self.send_command(spec_action[1],spec_action[2])
+            
+                                    
+    def get_commands_for_state(self,node_id:str):
+        conns = self.action_graph.get_connections(node_id)
+        
+        if len(conns) == 0:
+            return None
+        
+        nodes = self.action_graph.get_node_by_ids(conns)
+        
+        values = [(node[1],conn[1],conn[2]) for node,conn in zip(nodes,conns)]
+        
+        best_action = max(values,key=lambda x: x[0])
+        
+        return best_action
+        
+        
     
+    def propogate_value_through_graph(self,node_id:str,value:float,depth:int=10):
+        
+        if depth == 0:
+            return
+        
+        conns = self.action_graph.get_backwards_connections(node_id)
+        
+        _value = 0.8*value
+        _depth = depth - 1
+        
+        _from_ids = [ conn[0] for conn in conns]
+        
+        nodes = self.action_graph.get_node_by_ids(_from_ids)
+        
+        values = [node[1]*0.6 + 0.4*_value for node in nodes]
+        
+        self.action_graph.update_nodes_metadata(_from_ids,values)
+        
+        for id in _from_ids:                        
+            self.propogate_value_through_graph(id,_value,_depth)
+        
+    def action_execution(self,score:float):
+        
+        dscore = score - self.last_score
+
+        self.last_score = score
+        
+        cmd = self.action_list[self.action_iter]
+        
+        self.send_command(cmd)
+        
+        if self.action_iter < len(self.action_list):
+            self.action_iter += 1
+        else:
+            self.action_executing = False
+            return
+        
+        if dscore < -1.0:
+            self.action_executing = False
                 
     def tick_func(self):
         # emotion validation pipeline
         
         # face detection
         
-        # faces = self.face_yolo(self.image)
-        
-        # mean_embed = np.zeros(160,dtype=np.float32)
-        
-        # sum_distances = 0
-        
-        # Maybe we should take into account only the closest
-        # face ?
-        
         self.current_face_embeddings.clear()
-        
-        # examine resulted faces
-        # for result in faces:
-        #     boxes = result.boxes
-        #     for box in boxes:
-        #         x1, y1, x2, y2 = map(int, box.xyxy[0])
-                
-        #         width = x2 - x1
-        #         height = y2 - y1
-                
-        #         distance = width*height
-                
-        #         conf = box.conf[0]
-        #         cls = int(box.cls[0])
-                
-        #         img = self.image[y1:y2,x1:x2]
-                
-        #         embed = np.array(self.deep_id.process(img)[0],dtype=np.float32)
-
-        #         self.current_face_embeddings.append([embed,distance])
         
         # evaluate emotion states
         
@@ -756,120 +651,14 @@ class MapMind(Node):
         self.emotion_pub.publish(emotions)
         
         score = self.emotion_state_calculate(emotions_arr)
-        
-        dscore = score - self.last_score
-
-        self.last_score = score
-        
+                
         # send ears position
         self.send_ears_state(emotions_arr)
         
-        # It looks like 224x224 splitted into 49 parts of 32x32 is
-        # a bit too much for Qdrant to handle in real time
-        # 
-        # we can reduce the resolution of input image and thus
-        # number of embeddings generated or reduce the 
-        # dimensionality of embeddings ...
-        #
-        # Apparently reducing resolution to 56x56 and splitting
-        # into 49 parts of 8x8 gives medicore results but 
-        # for single 8x8 embedding we can retrieve points in real time
-        # but is the 8x8 too small?
+        self.point_seeking(score)
         
-        
-        if score < 0:
-            # if image and depth is present
-            if self.image is not None and self.depth is not None:
-                # generate embeddings
-                self.last_img_embeddings = generate_embedding(self.image,self.depth)
-                # gather points associated with embeddings
-                points = self.get_points_from_embeddings(self.last_img_embeddings)
-        
-                # # update emotion map with those points
-                for p in points:
-                    x = p[0]
-                    y = p[1]
-                    v = p[2]
-                    
-                    self.push_point_at_position(x,y,v)
-                                
-                # self.get_logger().info(f"Retrieved {len(points)} points from map")
-                # update image embeddings with current points in map
-                
-                # a major slow down
-                self.add_point_to_embeddings((self.x,self.y,score),self.last_img_embeddings)
-
-            # update current position point
-            for point in points:
-                self.push_point_at_position(point[0],point[1],score)
-        
-        return
-        
-        if self.action_executing:
-            
-            action = self.action_list[self.action_iter]
-            
-            self.action_iter += 1
-            
-            if dscore < -0.25:
-                # perform mutations
-                self.action_executing = False
-                self.stop()
-                
-                self.mutate_actions(self.action_list,threshold=0.25,mean=0.5)
-                
-                # self.update_actions_for_embeddings(self.action_list,score)
-                return
-            
-            if self.action_iter == len(self.action_list) or score > 0.0:
-                # perform action set trim
-                self.action_list = self.action_list[:self.action_iter]
-                
-                self.action_executing = False
-                self.stop()
-                
-                # self.update_actions_for_embeddings(self.action_list,score)
-                return
-            
-            self.send_command(action[0],action[1])
-            self.get_logger().info("Performing actions")
-            
-            return
-        
-        actions_lists = []
-        
-        # when our robot is calm there is no need to take any actions ...
-        if score >= 0.0:
-            self.stop()
-            return
-        
-        # retrive actions associated with visual data        
-        # actions_lists.extend(
-        #     self.image_action_retrival()
-        # )
-        
-        # retrive actions associated with audio data ( mel spectogram )
-        
-        # actions_lists.extend(
-        #     self.spectogram_action_retrival()
-        # )        
-        
-        # perform crossover and mutations on gathered actions
-        
-        # sorted_actions_lists = sorted(actions_lists,
-        #                               key = lambda x: x['score'],
-        #                               reverse=True)
-        
-        # if len(sorted_actions_lists) > 0 and sorted_actions_lists[0]['score'] > 0.0:
-        #     self.action_list = sorted_actions_lists[0]["actions"]
-        # else:
-        #     self.action_list = self.action_crossovers(sorted_actions_lists)
-        
-        self.action_iter = 0
-        
-        self.get_logger().info(f"Action list lenght: {len(self.action_list)}")
-        
-        self.action_executing = True
+        # Think about inner workings of boredom
+        # Move to the direction of point with higher score
         
         
     def tick_callback(self):

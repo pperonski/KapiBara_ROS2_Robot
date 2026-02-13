@@ -136,8 +136,8 @@ def generate_launch_description():
         joint_broad_spawner,
         ears_controller_spawner,
         mic,
-        # map_mind,
-        delayed_mola
+        map_mind,
+        # delayed_mola
         # delayed_rtabmap
     ])
 
